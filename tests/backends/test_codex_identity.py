@@ -1,0 +1,415 @@
+import os
+import subprocess
+import sys
+from dataclasses import replace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from zab.backends.codex import BOT_KEY, GIT_KEYS, SESSION_KEY, CodexBackend, identity_config
+from zab.config import BackendConfig
+from zab.core import types as t
+
+pytestmark = pytest.mark.contract
+#: `thread/read` of a thread the app-server holds loaded: `open_session` resumes it (#632). A
+#: cold thread is resumed at its next use (`_resume`), which these tests call directly.
+LOADED = {"thread": {"id": "s", "cwd": "/repo", "status": {"type": "idle"}}}
+#: The run of the app-server these backends reach (`app_server_instance`, #830), as a connect
+#: sets it: a record of an applied identity vouches only for a load in it.
+RUN = "boot/123/456"
+
+
+def backend() -> CodexBackend:
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+    b.instance = RUN
+    return b
+
+
+def spec(identity=True):
+    return t.SessionSpec(
+        cwd="/repo",
+        name="test",
+        git_identity=t.GitIdentity("Codex · test", "test-bot@example.zulipchat.com")
+        if identity
+        else None,
+    )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_fake_tool_commit_author_and_committer(tmp_path, enabled):
+    identity = identity_config(spec(enabled))
+    env = dict(os.environ)
+    for key in identity["shell_environment_policy.exclude"]:
+        env.pop(key, None)
+    env.update(identity["shell_environment_policy.set"])
+
+    def git(*args):
+        return subprocess.check_output(  # noqa: S603 - fixed test argv
+            ["git", "-C", str(tmp_path), *args],  # noqa: S607
+            env=env,
+            text=True,
+        ).strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Participant")
+    git("config", "user.email", "participant@example.test")
+    git("commit", "--allow-empty", "-qm", "fake tool commit")
+    assert git("log", "-1", "--format=%an|%cn") == (
+        "Codex · test|Codex · test" if enabled else "Participant|Participant"
+    )
+    assert git("log", "-1", "--format=%ae|%ce") == (
+        "test-bot@example.zulipchat.com|test-bot@example.zulipchat.com"
+        if enabled
+        else "participant@example.test|participant@example.test"
+    )
+    if not enabled:
+        assert all(k not in env for k in GIT_KEYS)
+
+
+async def test_start_and_cold_resume_send_verified_config():
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+    b.rpc.call.side_effect = [{"config": {}}, {"thread": {"id": "s", "cwd": "/repo"}}, {}]
+    await b.create_session(spec())
+    assert b.rpc.call.call_args_list[1].args[1]["config"] == identity_config(spec())
+    b.specs.clear()
+    b.resumed.clear()  # a new connection
+    b.rpc.call.reset_mock()
+    b.rpc.call.side_effect = [
+        {"config": {}},  # before the check (review of #818, N1)
+        {"data": ["other"], "nextCursor": "next"},
+        {"data": []},
+        {"thread": {"id": "s", "cwd": "/repo"}},
+        {"data": []},
+    ]
+    await b._resume("s", spec())
+    assert b.rpc.call.call_args_list[3].args[1]["config"] == identity_config(spec())
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_loaded_unknown_identity_is_refused_without_interrupting(enabled):
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+    b.rpc.call.side_effect = [LOADED, {"config": {}}, {"data": ["s"]}]
+    with pytest.raises(t.SessionRefused, match="unverified git identity"):
+        await b.open_session("s", spec(enabled))
+    assert "s" not in b.specs
+    assert [c.args[0] for c in b.rpc.call.call_args_list] == [
+        "thread/read",
+        "config/read",
+        "thread/loaded/list",
+    ]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_applied_identity_survives_backend_restart_and_settings_change(enabled):
+    import json
+    from dataclasses import asdict, replace
+
+    b = backend()
+    b.rpc.call.side_effect = [{"config": {}}, {"thread": {"id": "s", "cwd": "/repo"}}, {}]
+    info = await b.create_session(spec(enabled))
+    assert info.settings.extra["applied_instance"] == RUN
+    b.catalog.load = AsyncMock(return_value=None)
+    # Creation's configured defaults arrive without backend metadata.
+    accepted = await b.update_settings("s", t.SessionSettings(effort="medium"))
+    assert accepted.extra["applied_git_identity"] == info.settings.extra["applied_git_identity"]
+    persisted = json.dumps(asdict(accepted))
+    fresh = backend()  # a bridge restart: the same run of the app-server holds it
+    fresh.rpc.call.side_effect = [
+        LOADED,  # with this identity
+        {"config": {}},
+        {"thread": {"id": "s", "cwd": "/repo"}},
+        {"data": []},
+    ]
+    reopened = await fresh.open_session(
+        "s", replace(spec(enabled), settings=t.SessionSettings(**json.loads(persisted)))
+    )
+    assert reopened.settings.extra == accepted.extra
+    assert [c.args[0] for c in fresh.rpc.call.call_args_list] == [
+        "thread/read",
+        "config/read",
+        "thread/resume",
+        "thread/turns/list",
+    ]
+
+
+async def test_changed_persisted_identity_still_refuses_loaded_thread():
+    from dataclasses import replace
+
+    record = {"applied_git_identity": "off", "applied_instance": RUN}
+    candidate = replace(spec(), settings=t.SessionSettings(extra=record))
+    b = backend()
+    b.rpc.call.side_effect = [LOADED, {"config": {}}, {"data": ["s"]}]
+    with pytest.raises(t.SessionRefused, match="unverified git identity"):
+        await b.open_session("s", candidate)
+    assert [c.args[0] for c in b.rpc.call.call_args_list] == [
+        "thread/read",
+        "config/read",
+        "thread/loaded/list",
+    ]
+
+
+async def test_auto_fallback_records_off_only_after_cold_resume():
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+    b.rpc.call.side_effect = [
+        {"config": {}},
+        {"data": []},
+        {"thread": {"id": "s", "cwd": "/repo"}},
+        {"data": []},
+    ]
+    info = await b._resume("s", spec(False))
+    assert info.settings.extra["applied_git_identity"] == "off"
+    assert b.rpc.call.call_args_list[2].args[1]["config"] == identity_config(spec(False))
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("resume", [True, False])
+async def test_identity_preserves_effective_environment_policy(enabled, resume):
+    from copy import deepcopy
+
+    policy = {
+        "exclude": ["DATABASE_URL", "PRIVATE_*"],
+        "set": {"KEEP_ME": "configured", "GIT_AUTHOR_NAME": "old override"},
+        "inherit": "core",
+        "ignore_default_excludes": False,
+    }
+    before = deepcopy(policy)
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+
+    async def call(method, params):
+        if method == "config/read":
+            assert params == {"cwd": "/repo", "includeLayers": False}
+            return {"config": {"shell_environment_policy": policy}}
+        if method in ("thread/start", "thread/resume"):
+            overrides = params["config"]
+            assert overrides["shell_environment_policy.exclude"] == [
+                "DATABASE_URL",
+                "PRIVATE_*",
+                *GIT_KEYS,
+                BOT_KEY,
+                SESSION_KEY,
+            ]
+            values = overrides["shell_environment_policy.set"]
+            assert values["KEEP_ME"] == "configured"
+            assert values.get("GIT_AUTHOR_NAME") == ("Codex · test" if enabled else "old override")
+            assert set(overrides) == {
+                "shell_environment_policy.exclude",
+                "shell_environment_policy.set",
+            }
+            return {"thread": {"id": "s", "cwd": "/repo"}}
+        return {"data": []}
+
+    b.rpc.call.side_effect = call
+    if resume:
+        await b._resume("s", spec(enabled))
+    else:
+        await b.create_session(spec(enabled))
+    assert policy == before
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("resume", [True, False])
+async def test_identity_accepts_null_policy_fields(enabled, resume):
+    # Live 0.157.1 config/read with no configured policy returns explicit nulls.
+    policy = {
+        "exclude": None,
+        "set": None,
+        "inherit": None,
+        "ignore_default_excludes": None,
+        "include_only": None,
+    }
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+    sent = {}
+
+    async def call(method, params):
+        if method == "config/read":
+            return {"config": {"shell_environment_policy": policy}}
+        if method in ("thread/start", "thread/resume"):
+            sent.update(params["config"])
+            return {"thread": {"id": "s", "cwd": "/repo"}}
+        return {"data": []}
+
+    b.rpc.call.side_effect = call
+    if resume:
+        await b._resume("s", spec(enabled))
+    else:
+        await b.create_session(spec(enabled))
+    assert sent["shell_environment_policy.exclude"] == [*GIT_KEYS, BOT_KEY, SESSION_KEY]
+    who = ("Codex · test", "test-bot@example.zulipchat.com")
+    expected = dict(zip(GIT_KEYS, who * 2, strict=True))
+    assert sent["shell_environment_policy.set"] == (expected if enabled else {})
+
+
+@pytest.mark.parametrize("resume", [True, False])
+async def test_unknown_policy_never_starts_or_resumes_a_thread(resume):
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+
+    async def call(method, params):
+        if method == "thread/loaded/list":
+            return {"data": []}
+        assert method == "config/read"
+        raise t.BackendUnavailable("config unavailable")
+
+    b.rpc.call.side_effect = call
+    with pytest.raises(t.BackendUnavailable, match="config unavailable"):
+        if resume:
+            await b._resume("s", spec())
+        else:
+            await b.create_session(spec())
+    assert not b.specs
+    assert not {"thread/start", "thread/resume"} & {c.args[0] for c in b.rpc.call.call_args_list}
+
+
+def apply_policy(config: dict, base: dict[str, str]) -> dict[str, str]:
+    """What a Codex shell gets from these overrides: exclusions first, then `set`."""
+    env = {k: v for k, v in base.items() if k not in config["shell_environment_policy.exclude"]}
+    return env | config["shell_environment_policy.set"]
+
+
+@pytest.mark.parametrize("bot", ["codex-alice", ""])
+def test_tool_processes_name_the_bot_or_lose_an_inherited_one(bot):
+    """Issue #248: a tool process carries ZAB_BOT from the spec, so `zab history` reads as
+    the session's bot; without a bot, the app-server's own ZAB_BOT never reaches it."""
+    session = replace(spec(), bot=bot)
+    env = apply_policy(identity_config(session), dict(os.environ) | {BOT_KEY: "the-daemon"})
+    seen = subprocess.check_output(
+        [sys.executable, "-c", "import os; print(os.environ.get('ZAB_BOT', '-'))"],
+        env=env,
+        text=True,
+    ).strip()
+    assert seen == (bot or "-")
+    # The spec's bot overrides a configured one; without a bot, the user's own `set` stays,
+    # as it does for the git identity in "off" mode.
+    configured = {"exclude": None, "set": {BOT_KEY: "configured"}}
+    who = ("Codex · test", "test-bot@example.zulipchat.com")
+    assert identity_config(session, configured)["shell_environment_policy.set"] == {
+        **dict(zip(GIT_KEYS, who * 2, strict=True)),
+        BOT_KEY: bot or "configured",
+    }
+
+
+@pytest.mark.parametrize("session", ["3f9c2a7b-0000-4000-8000-000000000655", ""])
+def test_tool_processes_name_the_session_or_lose_an_inherited_one(session):
+    """Issue #655: a tool process carries ZAB_SESSION from the spec, so that `zab job` knows the
+    session that started a job; without one, the app-server's own ZAB_SESSION never reaches
+    it (SPEC §5.6)."""
+    named = replace(spec(), bot="codex-alice", session=session)
+    env = apply_policy(identity_config(named), dict(os.environ) | {SESSION_KEY: "the-daemon"})
+    seen = subprocess.check_output(
+        [sys.executable, "-c", "import os; print(os.environ.get('ZAB_SESSION', '-'))"],
+        env=env,
+        text=True,
+    ).strip()
+    assert seen == (session or "-")
+    assert env[BOT_KEY] == "codex-alice"  # beside ZAB_BOT, which it leaves alone
+    configured = {"exclude": None, "set": {SESSION_KEY: "configured"}}
+    values = identity_config(named, configured)["shell_environment_policy.set"]
+    assert values[SESSION_KEY] == (session or "configured")
+
+
+async def test_start_and_resume_carry_the_specs_bot():
+    """Issue #248: thread/start and a cold thread/resume both send the spec's ZAB_BOT next to
+    the git identity, the path verified to reach shell processes (DECISIONS, 2026-10-11)."""
+    session = replace(spec(), bot="codex-alice")
+    sent: list[tuple[str, dict]] = []
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+
+    async def call(method, params):
+        if method == "config/read":
+            return {"config": {"shell_environment_policy": {"exclude": None, "set": None}}}
+        if method in ("thread/start", "thread/resume"):
+            sent.append((method, params["config"]["shell_environment_policy.set"]))
+            return {"thread": {"id": "s", "cwd": "/repo"}}
+        return {"data": []}
+
+    b.rpc.call.side_effect = call
+    info = await b.create_session(session)
+    fresh = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    fresh.rpc = b.rpc
+    await fresh._resume("s", replace(session, settings=info.settings))
+    assert [(method, values[BOT_KEY]) for method, values in sent] == [
+        ("thread/start", "codex-alice"),
+        ("thread/resume", "codex-alice"),
+    ]
+
+
+async def test_start_and_resume_carry_the_specs_session():
+    """Issue #655: thread/start and a cold thread/resume each send the spec's ZAB_SESSION, the
+    resume the session it reopens for (a new row's after `!detach` and `!attach`), not the one
+    the thread was started for."""
+    first, second = "3f9c2a7b-0000-4000-8000-000000000001", "3f9c2a7b-0000-4000-8000-000000000002"
+    sent: list[tuple[str, dict]] = []
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+
+    async def call(method, params):
+        if method == "config/read":
+            return {"config": {"shell_environment_policy": {"exclude": None, "set": None}}}
+        if method in ("thread/start", "thread/resume"):
+            sent.append((method, params["config"]))
+            return {"thread": {"id": "s", "cwd": "/repo"}}
+        return {"data": []}
+
+    b.rpc.call.side_effect = call
+    info = await b.create_session(replace(spec(), session=first))
+    fresh = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    fresh.rpc = b.rpc
+    await fresh._resume("s", replace(spec(), session=second, settings=info.settings))
+    assert [(m, c["shell_environment_policy.set"][SESSION_KEY]) for m, c in sent] == [
+        ("thread/start", first),
+        ("thread/resume", second),
+    ]
+    assert all(SESSION_KEY in c["shell_environment_policy.exclude"] for _, c in sent)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_a_loaded_thread_with_a_known_identity_is_resumed_whatever_its_bot(enabled):
+    """DECISIONS, 2026-10-13: ZAB_BOT is not part of the loaded-thread check. A thread the
+    app-server loaded without a bot, whose persisted marker records only the git identity (and
+    the app-server's run, #830), is resumed with a bot, not refused; so is one reopened for
+    another bot. Until the app-server restarts its shells keep the old ZAB_BOT, which only sets
+    `zab history`'s default."""
+    marker = (
+        {"name": "Codex · test", "email": "test-bot@example.zulipchat.com"} if enabled else "off"
+    )
+    v021 = replace(
+        spec(enabled),
+        bot="codex-alice",
+        settings=t.SessionSettings(extra={"applied_git_identity": marker, "applied_instance": RUN}),
+    )
+    b = backend()
+    sent: list[str] = []
+
+    async def call(method, params):
+        if method == "thread/read":
+            return LOADED
+        if method == "thread/loaded/list":
+            return {"data": ["s"]}  # loaded: a refusal would follow this call
+        if method == "config/read":
+            return {"config": {"shell_environment_policy": {"exclude": None, "set": None}}}
+        if method == "thread/resume":
+            sent.append(params["config"]["shell_environment_policy.set"][BOT_KEY])
+            return {"thread": {"id": "s", "cwd": "/repo"}}
+        return {"data": []}
+
+    b.rpc.call.side_effect = call
+    info = await b.open_session("s", v021)
+    await b.open_session("s", replace(v021, bot="codex-bob", settings=info.settings))
+    assert sent == ["codex-alice", "codex-bob"]
+    assert "thread/loaded/list" not in [c.args[0] for c in b.rpc.call.call_args_list]
