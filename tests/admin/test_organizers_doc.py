@@ -199,8 +199,9 @@ def test_the_rules_the_runbook_states_are_the_bots() -> None:
     assert (TIMEOUT, TIMEOUTS) == (900, {"launch": 3600, "trust-fix": 3600} | dict.fromkeys(
         ("rollout", "final-sync", "export", "teardown", "upgrade-server"), 1800))  # fmt: skip
     assert (
-        "The limits are 60 minutes for `!launch`; for `!trust-fix`, 60 minutes, or 2 minutes a "
-        "row above 30 (§4.4); 30 minutes for `!rollout`, `!final-sync`, "
+        "The limits are 60 minutes for `!launch`; for `!trust-fix`, 60 minutes, or 2.5 minutes "
+        "a row above 24 (§4.4); for `!rollout`, 30 minutes, or a minute a row above 30 (§3.5); "
+        "30 minutes for `!final-sync`, "
         "`!export`, `!teardown` and a deployer's `!upgrade-server`; for `!retire`, 60 minutes, "
         "or 20 minutes a row above three, "
         "and 55 minutes more a row with `export` (§5.3); 15 minutes for anything else." in TEXT
@@ -209,12 +210,17 @@ def test_the_rules_the_runbook_states_are_the_bots() -> None:
         EXPORT_ROW_S,
         RETIRE_FLOOR_S,
         RETIRE_ROW_S,
+        ROLLOUT_FLOOR_S,
+        ROLLOUT_ROW_S,
+        START_AT_ONCE,
         TRUST_FIX_FLOOR_S,
         TRUST_FIX_ROW_S,
     )
 
-    assert (TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S) == (3600, 120)  # #992, §4.4
-    assert "within 60 minutes, or 2 minutes a row above 30 (82 minutes for 41 rows)" in TEXT
+    assert (TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S) == (3600, 150)  # #992, §4.4; #995
+    assert (ROLLOUT_FLOOR_S, ROLLOUT_ROW_S, START_AT_ONCE) == (1800, 60, 8)  # #995, §3.5
+    assert "At most 8 at a time." in TEXT and "`power`" in TEXT
+    assert "within 60 minutes, or 2.5 minutes a row above 24 (103 minutes for 41 rows)" in TEXT
 
     assert (RETIRE_FLOOR_S, RETIRE_ROW_S, EXPORT_ROW_S) == (3600, 1200, 3300)  # the review of #566
     assert "The apply stops at 60 minutes, or 20 minutes a row above three, and 55" in TEXT
@@ -560,7 +566,7 @@ async def results() -> list[str]:
                 Requirement("above-half", 1, ("rollout", "2")), (), "0" * 64, None, None,
                 None, "", None)  # fmt: skip
     action = SimpleNamespace(steps=(1, 2), applied=(1, 2), verb="rollout", timeout=None)
-    job = SimpleNamespace(plan=plan, bot=None, action=action)
+    job = SimpleNamespace(plan=plan, bot=None, action=action, part="")
     said, push = Said(), "admin/push_config.py"
     outcomes = (
         ("done", [Ran(push, 0), Ran("admin/status.py", 0)], 245, "ok\n" * 100),

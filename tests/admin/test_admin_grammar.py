@@ -493,7 +493,7 @@ def test_all_or_spares_that_select_nothing_are_refused(ctx, message, reason):
 )
 def test_a_selection_has_real_bools_and_tuples(fields):
     """A truthy "false", read back from a stored plan, must never mean `all` (#333)."""
-    with pytest.raises(ValueError, match="two bools and two tuples"):
+    with pytest.raises(ValueError, match="three bools and two tuples"):
         Selection(**{"slugs": ("alice",), **fields})
 
 

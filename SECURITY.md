@@ -34,7 +34,7 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFn751Mjzz953Fef520ptf66Acjv5XMPiFX/rCngmeFx
 Its fingerprint is `SHA256:gTGOWot/5rxMwPKceRsy7CGeDWQMLK/LvuDeq0xzQds`. As a line of git's `allowed_signers` file:
 
 ```text
-drew@math.mit.edu namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFn751Mjzz953Fef520ptf66Acjv5XMPiFX/rCngmeFx
+zab-rehearsal-1040@example.invalid namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKbeik9MnFeXmVbnW/W7OcS8f1DzRAsDDoa8HkKQcCn8
 ```
 
 To check a tag, with git 2.34 or newer and OpenSSH 8.2 or newer, in a clone of this repository, where the file goes in `.git/`, outside the work tree:

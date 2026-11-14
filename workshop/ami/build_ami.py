@@ -201,6 +201,20 @@ check as_lean bash -c "$lean"
 echo "time second Mathlib import: $((SECONDS - start)) s"
 cmp="t=\$(mktemp -d) && cp -r $d/comparator/. \$t && cd \$t"
 check as_lean bash -c "$cmp && timeout 300 comparator-run config.json"
+# #997: a fresh project's first `lake build` (lean-project's template imports Mathlib.Tactic)
+# in a network namespace of its own, so with no network at all: Lake fetches nothing, and
+# ~/.cache/mathlib is as it was (gone from images since #997), so nothing ran Mathlib's cache.
+# The scratch project goes at the exit, passed or not: its link first, never what it points to.
+fresh='had=$(ls -d ~/.cache/mathlib 2>/dev/null); t=$(mktemp -d) || exit 1'
+fresh="$fresh"'; end() { cd / && rm -f "$t/fresh/.lake/packages" && rm -rf "$t"; }; trap end EXIT'
+fresh="$fresh"'; lean-project "$t/fresh" && cd "$t/fresh" && timeout 900 lake build'
+fresh="$fresh"' && test "$(ls -d ~/.cache/mathlib 2>/dev/null)" = "$had"'
+start=$SECONDS
+check sudo unshare --net -- runuser -u agent -- env -i HOME=/home/agent \
+  PATH=/home/agent/.elan/bin:/usr/local/bin:/usr/bin:/bin bash -c "$fresh"
+echo "time a fresh project's first lake build, offline: $((SECONDS - start)) s"
+archives=$(sudo du -sh /home/agent/.cache/mathlib 2>/dev/null | cut -f1)
+echo "Mathlib's downloaded archives on the image: ${archives:-none}"
 # AMI v3: Julia and Oscar. The first `using Oscar` reads the depot, which EBS fetches lazily;
 # it must load from the precompiled cache ("Precompiling" would mean a rebuild): timed twice.
 # On failure the output's tail is shown. Before the timed loads Julia says whether it takes

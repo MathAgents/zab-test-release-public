@@ -77,6 +77,7 @@
        "last_verdict": "busy: 1 session",
        "minutes": 60
       },
+      "instance": null,
       "last_activity": "2027-01-15T07:30:00Z",
       "last_error": "token [redacted secret]",
       "load": {
@@ -189,6 +190,7 @@
        "last_verdict": "busy: 1 session",
        "minutes": 60
       },
+      "instance": null,
       "last_activity": "2027-01-15T07:30:00Z",
       "last_error": null,
       "load": {

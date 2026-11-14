@@ -416,12 +416,13 @@ def test_user_data_runs_every_step_without_set_e():
 
 
 def test_first_boot_applies_swap_pins_and_mcp():
-    """Drew's decisions relayed on issue #36 (Fri 02:45 and 03:10): an 8 GiB swap file, Claude
-    Code's auto-updater off through managed settings, Codex's update check off, and the LMFDB MCP
-    server for both CLIs, applied idempotently at first boot on participant and spare VMs."""
+    """Drew's decisions relayed on issue #36 (Fri 02:45 and 03:10): a swap file (5 GiB since
+    #997, 8 GiB before), Claude Code's auto-updater off through managed settings, Codex's update
+    check off, and the LMFDB MCP server for both CLIs, applied idempotently at first boot on
+    participant and spare VMs."""
     for row in (fresh_row(), ac.spare_rows(1)[0]):
         script = ac.render_user_data(row)
-        assert "fallocate -l 8G /swapfile" in script
+        assert "fallocate -l 5G /swapfile" in script and "8G" not in script
         assert (
             "'/swapfile none swap sw,nofail 0 0'" in script
         )  # nofail: a lost swap file must not block boot
@@ -445,13 +446,37 @@ def test_first_boot_applies_swap_pins_and_mcp():
     # the image's README describes the same block ("First boot")
     doc = (ac_dir().parent / "ami" / "README.md").read_text()
     for needle in (
-        "fallocate -l 8G /swapfile",
+        "fallocate -l 5G /swapfile",
         "DISABLE_AUTOUPDATER",
         "check_for_update_on_startup = false",
         "[mcp_servers.lmfdb]",
         "mcp add --transport http --scope user lmfdb",
     ):
         assert needle in doc, needle
+
+
+@pytest.mark.parametrize(
+    ("active", "made"),
+    [
+        ("", ["fallocate -l 5G /swapfile", "mkswap /swapfile", "swapon /swapfile"]),
+        ("/swapfile", []),
+    ],
+    ids=["no swap", "a swap file on already"],
+)
+def test_first_boot_makes_the_swap_file_only_where_none_is_on(tmp_path, active, made):
+    """#997: the first boot makes a 5 GiB swap file where `/swapfile` isn't on, and leaves an
+    active one alone, whatever its size: a VM launched before keeps its 8 GiB. The block is run
+    as the user data runs it, with the commands that would change the machine recorded."""
+    block = ac.COMMON_FIRST_BOOT.split("\nfi\n", 1)[0] + "\nfi\n"
+    calls = tmp_path / "calls"
+    stubs = (
+        f'swapon() {{ if [ "$1" = --show=NAME ]; then printf "%s" "{active}"; '
+        f'else echo "swapon $*" >> {calls}; fi; }}\n'
+        f'fallocate() {{ echo "fallocate $*" >> {calls}; }}\nchmod() {{ :; }}\n'
+        f'mkswap() {{ echo "mkswap $*" >> {calls}; }}\n'
+    )
+    subprocess.run(["bash", "-c", stubs + block], check=True)  # noqa: S603, S607
+    assert (calls.read_text().splitlines() if calls.exists() else []) == made
 
 
 @pytest.mark.parametrize(

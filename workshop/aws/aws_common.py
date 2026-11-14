@@ -354,8 +354,15 @@ def is_spare_name(name: str) -> bool:
 #: Decisions taken after the AMI was specified (issue #36; ../ami/README.md, "First boot"), applied
 #: at every first boot so that they hold whether or not the image already carries them. Every step
 #: is idempotent and runs as root (cloud-init). Mirrored in `workshop/ami/build.sh`.
-#: - An 8 GiB swap file: Ubuntu AMIs have no swap, and a participant's big Magma or Sage job
-#:   would otherwise get an agent, or the bridge, OOM-killed. Its `/etc/fstab` line is added
+#: - A 5 GiB swap file (#997; 8 GiB before, which `df` counted as used on every first day):
+#:   Ubuntu AMIs have no swap, and 5 GiB holds what SPEC §7.10's peak, every turn in Lean,
+#:   needs beyond the VM's memory, mostly idle processes' memory: at its recorded sizes and a
+#:   guess at the `claude` processes', not measured yet, with about 1.2 GB to spare at the high
+#:   end. It no longer stands between a big job and the bridge: the bridge's units keep running
+#:   when the kernel's OOM killer kills one of their processes (`OOMPolicy=continue`, from `zab
+#:   service install`; DECISIONS, 2026-11-08, has the arithmetic). A VM that has a swap file on
+#:   already, as every VM launched before keeps its 8 GiB one, is left alone.
+#:   Not mirrored in `build.sh`: the image carries no swap file. Its `/etc/fstab` line is added
 #:   only when no `/swapfile` line is there, separated by a space or a tab: an image may carry
 #:   one, written by hand perhaps, and the file needs only one (#799).
 #: - Claude Code's auto-updater off through the managed settings file, which the participant's
@@ -373,7 +380,7 @@ def is_spare_name(name: str) -> bool:
 #:   `~/.claude.json`, so the participant's first login still runs onboarding (verified 2.1.285).
 COMMON_FIRST_BOOT = """\
 if ! swapon --show=NAME --noheadings | grep -qx /swapfile; then
-  fallocate -l 8G /swapfile && chmod 0600 /swapfile && mkswap /swapfile >/dev/null \\
+  fallocate -l 5G /swapfile && chmod 0600 /swapfile && mkswap /swapfile >/dev/null \\
     && swapon /swapfile
 fi
 grep -q '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw,nofail 0 0' >> /etc/fstab
@@ -418,7 +425,6 @@ WARM_PATHS = (
     # follow the link
     "/opt/lean",
     "/home/agent/lean",
-    "/home/agent/.cache/mathlib",
     "/usr/share/texlive",
     "/usr/share/texmf",
     "/home/agent/miniforge",
@@ -872,8 +878,11 @@ class Ec2:
     def wait_running(self, instance_id: str) -> None:
         self._ec2.get_waiter("instance_running").wait(InstanceIds=[instance_id])
 
-    def start(self, instance_ids: list[str]) -> None:
-        self._ec2.start_instances(InstanceIds=instance_ids)
+    def start(self, instance_ids: list[str]) -> list[dict[str, Any]]:
+        """EC2's `StartingInstances`: each one's `PreviousState`, which says whether this call
+        started it (`power.StartStop`, #995)."""
+        answer = self._ec2.start_instances(InstanceIds=instance_ids)
+        return list((answer or {}).get("StartingInstances") or [])
 
     def stop(self, instance_ids: list[str]) -> None:
         self._ec2.stop_instances(InstanceIds=instance_ids)

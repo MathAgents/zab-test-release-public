@@ -71,9 +71,9 @@ another credential.
   7.3 GB, mostly shared pages. Each agent runs up to 10 turns at once (`max_concurrent_turns`,
   #919), and a turn that uses Lean starts a Lean server of its own, about 1.3 GB idle with one
   small file open: with every turn in Lean at once, those and the agents' other processes fill
-  the VM's usable memory and run into the 8 GiB swap (SPEC §7.10). The common case, turns that
-  wait on the model, needs much less; Sage, Magma and comparator runs come on top. Where the
-  region's vCPU quota is short,
+  the VM's usable memory and run into the swap (SPEC §7.10; 5 GiB, 8 GiB on VMs launched
+  before #997). The common case, turns that wait on the model, needs much less; Sage, Magma
+  and comparator runs come on top. Where the region's vCPU quota is short,
   `--instance-type r7a.xlarge` keeps the 32 GiB on 4 vCPUs: the image is the same (x86-64), and
   `build_ami.py --smoke-only <ami> --smoke-instance-type r7a.xlarge` checks it on that type.
 - **Root volume:** gp3, 200 GiB (#205), deleted on termination.
@@ -141,9 +141,10 @@ uv run --with boto3 python workshop/aws/launch.py --roster test-roster.csv \
   `participant=<slug>` and the scope tags, and the first-boot script
   (`workshop/ami/README.md`, "First boot"): host name,
   git identity (the roster names and e-mail; a row without an e-mail fails), `~/work`,
-  `/etc/zab-participant.json` (slug and checkout), then the post-AMI decisions (an 8 GiB
-  swap file, Claude Code's auto-updater off through `/etc/claude-code/managed-settings.json`,
-  Codex's `check_for_update_on_startup = false`, the LMFDB MCP server for both CLIs; all
+  `/etc/zab-participant.json` (slug and checkout), then the post-AMI decisions (a 5 GiB
+  swap file, #997, Claude Code's auto-updater off through
+  `/etc/claude-code/managed-settings.json`, Codex's `check_for_update_on_startup = false`, the
+  LMFDB MCP server for both CLIs; all
   idempotent, mirrored in `workshop/ami/build.sh`). No key import and no cron job:
   participants get no SSH, organizers keep `ubuntu` with their own keys. A participant who
   asks for SSH gets it by hand, as `ubuntu`: `sudo -u agent ssh-import-id gh:<login>`. Check the
@@ -446,6 +447,14 @@ Behind `!grow-disk` (ORGANIZERS §4.1). It grows one row's root volume to `--siz
   VM's grows at its next boot, through cloud-init's `growpart`; the script never starts it.
 - **The file system alone:** the volume's own size, on a running VM, finishes a grow whose SSH
   step failed, at no cost and without the 6 hours' wait.
+- **`--auto-cap GB`** in place of `--size` (#998), for the admin bots' automatic growth of a
+  filling disk: half the volume's size again, rounded up to whole GB, at most GB; within the 6
+  hours of the volume's last modification, its file system alone. A VM that isn't running is
+  never grown. Every check above holds. Its last line, `auto result: ` and JSON, says what it
+  did: `grown` (exit 0), `failed` (exit 1), or, exit 3 and nothing changed, `stopped`, `capped`
+  (at GB already) or `wait` (within the 6 hours, the file system filling the volume already).
+  With `--expect-instance ID`, the instance whose disk was read, a row's VM that is another
+  instance now gives `replaced` (exit 3), before any change.
 
 SSH goes through the host key pinned in `--known-hosts`, with no forwarding. It needs
 `ec2:DescribeInstances`, `ec2:DescribeVolumes`, `ec2:DescribeVolumesModifications` and

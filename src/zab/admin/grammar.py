@@ -228,9 +228,13 @@ SPECS: dict[str, VerbSpec] = {
 LATER = frozenset({"rebind", "cancel"})
 _GROUPS = frozenset(key.split()[0] for key in SPECS if " " in key)  # roster, provision, month-end
 _TOPICS = frozenset(key.split()[0] for key in SPECS) | LATER
+#: The selection of every workshop's rows (#995): `!rollout VERSION every-workshop …` and
+#: `!trust-fix every-workshop`, on the server's bot alone, from a global admin (ADMIN §2.2).
+EVERY_WORKSHOP = "every-workshop"
+FLEETWIDE = frozenset({"rollout", "trust-fix"})
 #: Words that are keywords or setting names wherever a slug may stand (`steer` included, so that
 #: a bare `steer` can't select a participant of that name): no roster slug may be one of them.
-RESERVED = frozenset({"all", "spares"}).union(  # not !new-workshop's: it takes no slug
+RESERVED = frozenset({"all", "spares", EVERY_WORKSHOP}).union(  # not !new-workshop's: no slug
     *(spec.keywords + spec.settings for spec in SPECS.values() if not spec.only_global)
 )
 #: How a reason names each fixed argument it expected.
@@ -295,6 +299,7 @@ class Context:
 class Selection:
     """SEL, within the bot's workshop. `all` is every participant row, never the spares;
     `spares` every available spare. Named slugs and spares keep roster and spares order.
+    `every_workshop` (#995), alone, on the server's bot: every workshop's `all`.
 
     Never empty (§2.2: no implicit "everyone"): the scripts read a missing `--only` as every
     participant, so an empty selection, or one that resolves to no target, is an error."""
@@ -303,19 +308,26 @@ class Selection:
     spares: bool = False
     slugs: tuple[str, ...] = ()
     spare_names: tuple[str, ...] = ()
+    every_workshop: bool = False
 
     def __post_init__(self) -> None:
         names = (self.slugs, self.spare_names)
         if not (
             isinstance(self.all, bool)
             and isinstance(self.spares, bool)
+            and isinstance(self.every_workshop, bool)
             and all(isinstance(n, tuple) and all(isinstance(s, str) for s in n) for n in names)
         ):  # a truthy "false" read back from a stored plan must not mean `all`
-            raise ValueError("a selection is two bools and two tuples of names")
-        if not (self.all or self.spares or self.slugs or self.spare_names):
+            raise ValueError("a selection is three bools and two tuples of names")
+        some = self.all or self.spares or self.slugs or self.spare_names
+        if not (some or self.every_workshop):
             raise ValueError("an empty selection")
+        if some and self.every_workshop:
+            raise ValueError(f"`{EVERY_WORKSHOP}` stands alone")
 
     def tokens(self) -> tuple[str, ...]:
+        if self.every_workshop:
+            return (EVERY_WORKSHOP,)
         people = ("all",) if self.all else self.slugs
         return people + (("spares",) if self.spares else self.spare_names)
 
@@ -324,6 +336,8 @@ class Selection:
         ValueError when `all` or `spares` finds nothing there, rather than return a list that
         selects less than was asked, or nothing, and when a named slug or spare isn't the
         roster's own (it may have changed since the command was parsed)."""
+        if self.every_workshop:  # each workshop's own `all` (#995): never one roster's rows
+            raise ValueError(f"`{EVERY_WORKSHOP}` names no row of one workshop")
         if (self.all and not roster.slugs) or (self.spares and not roster.spares):
             raise ValueError("`all` or `spares` selects nothing in this roster")
         if not (
@@ -569,7 +583,10 @@ def _head(kind: str, word: str, ctx: Context, roster: Roster) -> object:
     return lookup[kind]()
 
 
-def _arguments(spec: VerbSpec, args: list[str], ctx: Context, roster: Roster) -> dict[str, object]:
+def _arguments(
+    spec: VerbSpec, args: list[str], ctx: Context, roster: Roster, verb: str = ""
+) -> dict[str, object]:
+    every = ctx.roster is None and verb in FLEETWIDE  # the server's bot's `every-workshop`
     fields: dict[str, object] = {}
     for kind in spec.head:
         name = kind.rstrip("?*")
@@ -606,13 +623,18 @@ def _arguments(spec: VerbSpec, args: list[str], ctx: Context, roster: Roster) ->
             word in spec.keywords
             or (spec.selection and (word == "all" or word in roster.slugs))
             or (spec.spares and (word == "spares" or word in roster.spares))
+            or (every and word == EVERY_WORKSHOP)
         ):
             raise _unexpected(word, spec)
     keywords = [word for word in spec.keywords if word in seen]
     if spec.exclusive and len(keywords) > 1:
         raise _Reject(f"give one of {' or '.join(spec.keywords)}")
     fields["keywords"] = frozenset(keywords)
-    if spec.selection:
+    if spec.selection and EVERY_WORKSHOP in seen:  # the server's bot's (#995), alone
+        if seen & {"all", "spares"}:
+            raise _Reject(f"`{EVERY_WORKSHOP}` already selects every workshop's rows: name none")
+        fields["selection"] = Selection(every_workshop=True)
+    elif spec.selection:
         fields["selection"] = _selection(spec, seen, roster)
     return fields
 
@@ -696,11 +718,20 @@ def _command(body: str, content: str, ctx: Context, dm: bool) -> Command:
     spec = SPECS[verb]
     if dm and not spec.dm:
         raise _Reject("only !help and !console work in a direct message; use the channel")
-    if ctx.roster is None and not spec.server:
-        raise _Reject("this is the server's bot: send workshop commands to the workshop's bot")
+    if ctx.roster is not None and EVERY_WORKSHOP in args:
+        raise _Reject(f"`{EVERY_WORKSHOP}` is the server's bot's: send it in its channel")
+    if (
+        ctx.roster is None
+        and not spec.server
+        and not (verb in FLEETWIDE and EVERY_WORKSHOP in args)
+    ):
+        hint = f", or `{EVERY_WORKSHOP}` in place of SEL here" * (verb in FLEETWIDE)
+        raise _Reject(
+            f"this is the server's bot: send workshop commands to the workshop's bot{hint}"
+        )
     if ctx.roster is not None and spec.only_global:
         raise _Reject(f"`!{verb}` is the server's: send it to the server's bot, in its channel")
-    fields = _arguments(spec, args, ctx, ctx.roster or Roster())
+    fields = _arguments(spec, args, ctx, ctx.roster or Roster(), verb)
     if quoted:
         if "channel" in fields:
             raise _Reject("`channel=` is given twice")

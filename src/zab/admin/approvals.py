@@ -77,6 +77,11 @@ def requirement(
     on the `[global]` bot; `rebinds` are the rows whose provisioned `email` or `github` a
     `!roster import` changes (stage 3): at most one per plan, as with `!rebind slug`."""
     verb, count, many = action.verb, str(len(action.targets)), config.destructive_approvals
+    if action.parts:  # every workshop's (#995): a global admin's, the rows of all of them
+        if action.workshop or fleet is not None:
+            raise PlanError(f"!{verb} of every workshop is the server's, for the [global] bot")
+        rows = str(sum(len(part.targets) for part in action.parts))
+        return Requirement(SERVER, 1, (verb, rows) if verb in PHRASE_ABOVE_HALF else ())
     if verb in ("upgrade-server", "new-workshop"):
         if action.workshop or fleet is not None:
             raise PlanError(f"!{verb} is a server verb, for the [global] bot")

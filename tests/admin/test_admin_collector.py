@@ -85,13 +85,21 @@ class FakeAws:
 
 
 class FakeRun:
+    """The sweep's status.py: `argvs` and `answer`, read as `!status` reads; `users` and
+    `user_answer`, as the read user alone (`--read-user-only`, #998)."""
+
     def __init__(self) -> None:
         self.argvs: list[list[str]] = []
         self.answer: dict = {"schema": 1, "vms": []}
+        self.users: list[list[str]] = []
+        self.user_answer: dict = {"schema": 1, "vms": []}
 
     def __call__(self, argv, env, cwd):
-        self.argvs.append(argv)
         assert env["HOME"].endswith("state") and env["TMPDIR"] == cwd
+        if "--read-user-only" in argv:
+            self.users.append(argv)
+            return json.dumps(self.user_answer)
+        self.argvs.append(argv)
         return json.dumps(self.answer)
 
 
@@ -223,7 +231,8 @@ def test_the_snapshot(site):
     carol = {k: v for k, v in status("carol", bridge="unreachable").items() if k != "host"}
     del carol["extra"]
     assert rows["carol"] == {"slug": "carol", "kind": "participant", "state": "no VM",
-                             "status": carol | {"at": NOW - 300, "source": "!status"}}  # fmt: skip
+                             "status": carol | {"at": NOW - 300, "source": "!status",
+                                                "instance": None}}  # fmt: skip
     # the spares apart (#715): alice and zed of alice, bob and zed; zab-spare-1 on its own
     assert {k: ws["cost"][k] for k in ("running", "vms", "spares", "spares_running")} == {
         "running": 2, "vms": 3, "spares": 1, "spares_running": 1,
@@ -286,19 +295,35 @@ def test_the_files_the_console_reads_are_0640_under_umask_0077(site):
     assert not [p for p in (state / "console").iterdir() if p.name.startswith(".")]
 
 
-def test_idle_stop_vms_are_never_swept(site):
-    """A VM is swept only when its last read shows idle stop off (module doc); never one with no
-    read, or whose read shows it on."""
+def only(argv):
+    return [argv[i + 1] for i, word in enumerate(argv) if word == "--only"]
+
+
+def test_idle_stop_vms_are_swept_as_the_read_user_alone(site):
+    """A VM is swept as `!status` reads it only when its last read shows idle stop off (module
+    doc); one with no read, or whose read shows it on, as the read user alone (#998), whose
+    sessions idle stop doesn't count; each running row's VM every SWEEP_EVERY, either way."""
     run = FakeRun()
     run.answer = {"schema": 1, "vms": [status("alice", idle=False) | {"zab_version": "0.2.7"}]}
+    run.user_answer = {"schema": 1, "vms": [status("alice") | {"disk_percent": 91}]}
     clock = Clock()
     c = make(site, run=run, clock=clock)
     c.tick()
-    assert run.argvs == []  # no status known: idle stop may be on, so no sweep
-    note_status(site.paths.state, "harvard-2026", {"schema": 1, "vms": [status("alice")]}, NOW)
-    clock.now += 3600
+    assert run.argvs == []  # no status known: idle stop may be on, so as the read user alone
+    assert [only(argv) for argv in run.users] == [["alice"], ["erin"]]  # bob's VM is stopped
+    assert run.users[0][-1] == "--read-user-only" and "--json" in run.users[0]
+    alice = c.status["harvard-2026/alice"]
+    assert (alice["source"], alice["disk_percent"], alice["at"]) == ("sweep", 91, NOW)
+    assert "harvard-2026/erin" not in c.status and "zab-test/erin" not in c.status  # left out
+    clock.now += collector.SWEEP_EVERY - 60
     c.tick()
-    assert run.argvs == []  # idle stop on
+    assert len(run.users) == 2  # not again within SWEEP_EVERY: alice's read, erin's try
+    note_status(site.paths.state, "harvard-2026", {"schema": 1, "vms": [status("alice")]},
+                clock.now)  # fmt: skip
+    clock.now += 3600
+    run.users.clear()
+    c.tick()
+    assert run.argvs == [] and [only(argv) for argv in run.users] == [["alice"], ["erin"]]
     note_status(site.paths.state, "harvard-2026", {"schema": 1, "vms": [
         status("alice", idle=False), status("bob", idle=False)]}, clock.now)  # fmt: skip
     c.tick()
@@ -317,6 +342,30 @@ def test_idle_stop_vms_are_never_swept(site):
     clock.now += 60
     c.tick()
     assert len(run.argvs) == 1
+
+
+def test_a_read_is_its_own_vms_after_a_hand_over(site):
+    """Codex round 4 on #1003: alice's VM read 95%, then a spare running since before that read
+    became her VM, and EC2 is read again before the next sweep. Her values were the old VM's:
+    the snapshot shows none for the new one (the console's Disk column, the automatic growth),
+    and the idle stop they show doesn't make the new one sweepable as ubuntu."""
+    aws, clock, run = FakeAws(), Clock(), FakeRun()
+    old = status("alice", idle=False) | {"instance": "i-a", "disk_percent": 95}
+    note_status(site.paths.state, "harvard-2026", {"schema": 1, "vms": [old]}, NOW - 60)
+    c = make(site, aws=aws, run=run, clock=clock)
+    alice = c.tick()["workshops"]["harvard-2026"]["vms"][0]
+    assert (alice["instance"], alice["status"]["disk_percent"]) == ("i-a", 95)
+    aws.instances["us-west-2"][0] = vm("i-n", "alice", "198.51.100.1", launched=2 * 86400)
+    clock.now += 60
+    alice = c.tick()["workshops"]["harvard-2026"]["vms"][0]
+    assert alice["instance"] == "i-n" and alice["status"] is None
+    harvard = c.config.workshops[0]
+    assert c.due(harvard, NOW + collector.SWEEP_EVERY) == ([], ["alice"])
+    new = status("alice", idle=False) | {"instance": "i-n", "disk_percent": 41}
+    note_status(site.paths.state, "harvard-2026", {"schema": 1, "vms": [new]}, clock.now)
+    alice = c.tick()["workshops"]["harvard-2026"]["vms"][0]
+    assert alice["status"]["disk_percent"] == 41  # its own read: shown
+    assert c.due(harvard, clock.now + collector.SWEEP_EVERY) == (["alice"], [])
 
 
 def test_a_read_that_finds_the_vm_down_keeps_its_values(site):
@@ -729,7 +778,7 @@ def test_a_sweep_without_an_answer_waits_too(site):
 
     class Garbage(FakeRun):
         def __call__(self, argv, env, cwd):
-            self.argvs.append(argv)
+            (self.users if "--read-user-only" in argv else self.argvs).append(argv)
             return "not json"
 
     run = Garbage()
@@ -782,7 +831,7 @@ def test_close_stops_the_sweep_before_its_next_workshop(site):
 
     c.run = run
     harvard, test = c.config.workshops
-    c._sweep_all([(harvard, ["alice"]), (test, ["erin"])])
+    c._sweep_all([(harvard, ["alice"], False), (test, ["erin"], True)])
     assert len(seen) == 1
 
 

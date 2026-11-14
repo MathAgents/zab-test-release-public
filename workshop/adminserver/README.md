@@ -16,7 +16,7 @@ global bot; the waker runs here too.
 | `admin.example.toml` | the model for `/etc/zab-admin/admin.toml` (root 0644); it loads with `zab.admin.config` |
 | `render_policy.py` | not installed: a deployer runs it to make the instance role's policies |
 | `ssh-rule.sh` | not installed: a deployer runs it on their laptop, right before an SSH step, so that the server's port 22 admits their address alone (docs/BOOTSTRAP.md §3.1); `--files-host`, the files host's |
-| `upgrade.py` | not installed: the upgrade driver (#772), which a deployer runs on their machine from the signed copy of the release the server runs, with `python3 -I`; `--setup` once per machine. It reaches no server, and publishes nothing: it reviews the new release with that copy's `deploy.sh`, signs and verifies its tag, pushes it to your clone's origin unless origin has another tag of the commit, and makes its copy `~/zab-vN`. `!upgrade-server` fetches the release's tags from `release_repo` (`docs/BOOTSTRAP.md` §13.4): with the public repository, the tags of the release's publication there, which its maintainer signs and pushes before the upgrade and this tool never makes (#960); `deploy.sh` from `~/zab-vN` stays the fallback (below) |
+| `upgrade.py` | not installed: the upgrade driver (#772), which a deployer runs on their machine from the signed copy of the release the server runs, with `python3 -I`; `--setup` once per machine. It reaches no server: it reviews the new release with that copy's `deploy.sh`, signs and verifies its tag, pushes it to your clone's origin unless origin has another tag of the commit, and makes its copy `~/zab-vN`. Once that tag verifies, `~/zab-vN`'s own driver can finish the run, with `--since` the running release (#991). Without `--publish` it publishes nothing. `!upgrade-server` fetches the release's tags from `release_repo` (`docs/BOOTSTRAP.md` §13.4): with the public repository, the tags of the release's publication there, which its maintainer makes with `--publish` before the upgrade. `--publish` exports the release with its own `tools/publish/export.py`, commits and signs the public tag in the public repository's clone, then pushes the public `main` and the tag atomically, and the private tag last, and ends with the `!upgrade-server` line; only the private repository has `tools/publish/` (#991). `deploy.sh` from `~/zab-vN` stays the fallback (below) |
 | `deploy.sh`, `release-paths`, `privileged-paths` | not installed by hand: the deployer runs `deploy.sh` (below), which installs the paths `release-paths` lists, and whose review shows the paths of `privileged-paths` first |
 
 ## Processes
@@ -335,6 +335,22 @@ commands.
   `--host` too, and the deploy again, which also requires `--expect-diff-sha256`, the diff you
   reviewed. Without `--base-signers`, a review still takes no host. A bootstrap and `--wheel`
   refuse it: they have no base.
+- **The plans in flight** (#989; ADMIN §2.4 step 6). An upgrade or a downgrade restarts the
+  bots, which interrupts every plan being planned, approved or applying. So the server half,
+  once the release is built and before anything is installed, runs the release's
+  `python -m zab.admin.inflight` as `zab-admin`, which reads `state.db` read-only, and takes the
+  bot's lock only as a probe, shared, for an instant, to tell whether a bot runs. It waits for
+  any plan applying or approved, up to `--plan-wait MINUTES` (15; 0 refuses at once), then
+  refuses, and names the plans pending or being planned, which don't hold it. `--interrupt-plans
+  REASON`, for a plan that is stuck, goes on: the reason reaches the server in the payload, never
+  in a command line, and the deploy record keeps it, with the plans the restart cut
+  (`interrupt_plans`, `interrupted`: `unknown` when the plans couldn't be read). The bootstrap
+  and `--wheel` refuse both. An in-band upgrade leaves the check out: its own plan applies,
+  holding every workshop's lock. **A release without the check** (0.2.20 and older, a
+  downgrade's target) runs its own server half, which has none: send `!plans` to every bot
+  first, as before. This release's `deploy.sh`, or a later one's, says so before its prompt,
+  and refuses both options for it; the target's own, as a rollback runs it, says nothing, and
+  refuses them as unknown options.
 - **The install,** by root through sudo. Root first copies the payload into its own 0700
   directory, refusing anything but plain files, and removes the secrets from the SSH user's
   staging area. Its git repository reads no configuration of root's, and after the fetch
@@ -400,9 +416,9 @@ commands.
   a rerun of the running version is refused.
 - **The bot's stop** is `KillMode=mixed`: SIGTERM goes to the bot alone, which stops each running
   script's process group within 5 s and records the apply as interrupted; SIGKILL still reaches
-  whatever is left in the unit (`TimeoutStopSec=60`). So **a deploy interrupts any apply under
-  way**: the plan ends INTERRUPTED and is not resumed. Deploy between applies (`!plans` lists the
-  pending ones; an apply's progress message shows it running), and request again after.
+  whatever is left in the unit (`TimeoutStopSec=60`). So **a restart interrupts any apply under
+  way**: the plan ends INTERRUPTED and is not resumed. A deploy waits for the applies first, or
+  refuses (*The plans in flight*, above).
 - **The bot** refuses to start until its checks pass: the owners and modes of `admin.toml`, the
   keys and the break-glass files, `backup_recipients` (root's, and every line a key `age` can
   encrypt to), and each bot's `GET /users/me`. It starts at the bootstrap,
